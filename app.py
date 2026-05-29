@@ -4,13 +4,12 @@ import logging
 import threading
 import subprocess
 import glob
-from pathlib import Path
 
 import telebot
 from flask import Flask
 import yt_dlp
 
-# ─── Logging Setup ────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -18,46 +17,55 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-PORT = int(os.environ.get("PORT", 8080))
-DOWNLOAD_DIR = "/tmp/downloads"
-MAX_SIZE_BYTES = 49 * 1024 * 1024  # 49MB
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+PORT        = int(os.environ.get("PORT", 8080))
+DOWNLOAD_DIR = "/tmp/vbot"
+MAX_BYTES   = 49 * 1024 * 1024   # 49 MB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ─── Flask (Keep-Alive Web Server) ────────────────────────────────
-flask_app = Flask(__name__)
+# ─── Flask keep-alive ─────────────────────────────────────────────
+app = Flask(__name__)
 
-@flask_app.route("/")
-def home():
-    return "✅ Bot is running!", 200
+@app.route("/")
+def index():
+    return "✅ Bot is alive!", 200
 
-@flask_app.route("/health")
+@app.route("/health")
 def health():
     return {"status": "ok"}, 200
 
-# ─── URL Detection ────────────────────────────────────────────────
-URL_PATTERN = re.compile(
-    r"https?://(www\.)?(youtube\.com|youtu\.be|tiktok\.com|"
-    r"instagram\.com|facebook\.com|fb\.watch|vm\.tiktok\.com)"
-    r"[^\s]*"
+# ─── URL regex ────────────────────────────────────────────────────
+URL_RE = re.compile(
+    r"https?://(www\.)?"
+    r"(youtube\.com|youtu\.be|tiktok\.com|vm\.tiktok\.com"
+    r"|instagram\.com|facebook\.com|fb\.watch)"
+    r"[^\s]*",
+    re.IGNORECASE
 )
 
-def extract_url(text: str) -> str | None:
-    match = URL_PATTERN.search(text)
-    return match.group(0) if match else None
+def find_url(text: str):
+    m = URL_RE.search(text)
+    return m.group(0) if m else None
 
-# ─── yt-dlp Options ───────────────────────────────────────────────
-def build_ydl_opts(output_path: str) -> dict:
+# ─── yt-dlp options ───────────────────────────────────────────────
+def ydl_opts(out_tmpl: str) -> dict:
     return {
-        "outtmpl": output_path,
-        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
+        "outtmpl": out_tmpl,
+        "format": (
+            "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+            "/best[ext=mp4][height<=720]/best"
+        ),
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -69,290 +77,227 @@ def build_ydl_opts(output_path: str) -> dict:
         "extractor_args": {
             "youtube": {"player_client": ["android", "web"]},
         },
-        "socket_timeout": 30,
-        "retries": 5,
-        "fragment_retries": 5,
-        "concurrent_fragment_downloads": 4,
         "postprocessors": [{
             "key": "FFmpegVideoConvertor",
             "preferedformat": "mp4",
         }],
     }
 
-# ─── Compress Video ───────────────────────────────────────────────
-def compress_video(input_path: str, output_path: str) -> bool:
-    """ffmpeg နဲ့ video ကို 49MB အောက် compress လုပ်မယ်"""
+# ─── ffprobe helper ───────────────────────────────────────────────
+def get_duration(path: str) -> float:
     try:
-        # Duration ရှာမယ်
-        probe = subprocess.run(
+        r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
-             input_path],
-            capture_output=True, text=True
+             "format=duration", "-of",
+             "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30
         )
-        duration = float(probe.stdout.strip() or "0")
-        if duration <= 0:
-            duration = 300  # default 5 min
+        return float(r.stdout.strip() or 0)
+    except Exception:
+        return 0.0
 
-        # Target bitrate တွက်မယ် (49MB = 49*8*1024 kbits)
-        target_bitrate = int((49 * 8 * 1024) / duration * 0.95)
-        video_bitrate = max(200, target_bitrate - 128)  # audio 128k ဖြုတ်ပြီး
-
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-c:v", "libx264",
-            "-b:v", f"{video_bitrate}k",
-            "-c:a", "aac", "-b:a", "128k",
-            "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
-            "-movflags", "+faststart",
-            output_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
-        return result.returncode == 0
-
+# ─── Compress ─────────────────────────────────────────────────────
+def compress(src: str, dst: str) -> bool:
+    duration = get_duration(src)
+    if duration <= 0:
+        duration = 300
+    target_kbps = max(200, int((49 * 8 * 1024) / duration * 0.93) - 128)
+    cmd = [
+        "ffmpeg", "-y", "-i", src,
+        "-c:v", "libx264", "-b:v", f"{target_kbps}k",
+        "-c:a", "aac", "-b:a", "128k",
+        "-vf", "scale='min(1280,iw)':'min(720,ih)'"
+              ":force_original_aspect_ratio=decrease",
+        "-movflags", "+faststart",
+        dst
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=360)
+        return r.returncode == 0
     except Exception as e:
-        logger.error(f"Compress error: {e}")
+        logger.error(f"compress error: {e}")
         return False
 
-# ─── Split Video ──────────────────────────────────────────────────
-def split_video(input_path: str, out_prefix: str) -> list[str]:
-    """Video ကို 49MB chunk တွေအဖြစ် ခွဲမယ်"""
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
-             input_path],
-            capture_output=True, text=True
-        )
-        duration = float(probe.stdout.strip() or "0")
-        file_size = os.path.getsize(input_path)
-        
-        if duration <= 0:
-            return []
-
-        # Chunk ရေ တွက်မယ်
-        num_chunks = max(2, int(file_size / MAX_SIZE_BYTES) + 1)
-        chunk_duration = duration / num_chunks
-
-        parts = []
-        for i in range(num_chunks):
-            start = i * chunk_duration
-            out_file = f"{out_prefix}_part{i+1}.mp4"
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-i", input_path,
-                "-t", str(chunk_duration),
-                "-c", "copy",
-                out_file
-            ]
-            result = subprocess.run(cmd, capture_output=True, timeout=180)
-            if result.returncode == 0 and os.path.exists(out_file):
-                parts.append(out_file)
-
-        return parts
-
-    except Exception as e:
-        logger.error(f"Split error: {e}")
+# ─── Split ────────────────────────────────────────────────────────
+def split_parts(src: str, prefix: str) -> list:
+    duration = get_duration(src)
+    size     = os.path.getsize(src)
+    if duration <= 0:
         return []
+    n     = max(2, int(size / MAX_BYTES) + 1)
+    chunk = duration / n
+    parts = []
+    for i in range(n):
+        out = f"{prefix}_part{i+1}.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(i * chunk),
+            "-i", src,
+            "-t", str(chunk),
+            "-c", "copy", out
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        if r.returncode == 0 and os.path.exists(out):
+            parts.append(out)
+    return parts
 
 # ─── Cleanup ──────────────────────────────────────────────────────
-def cleanup(*paths):
-    for p in paths:
+def cleanup(chat_id):
+    for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{chat_id}_*")):
         try:
-            if p and os.path.exists(p):
-                os.remove(p)
+            os.remove(f)
         except Exception:
             pass
 
-# ─── Main Download & Send Logic ───────────────────────────────────
-def download_and_send(chat_id: int, url: str, status_msg):
-    raw_path = os.path.join(DOWNLOAD_DIR, f"{chat_id}_raw.%(ext)s")
-    final_mp4 = os.path.join(DOWNLOAD_DIR, f"{chat_id}_raw.mp4")
-    compressed = os.path.join(DOWNLOAD_DIR, f"{chat_id}_compressed.mp4")
+# ─── Core download+send ───────────────────────────────────────────
+def process(chat_id: int, url: str, status_id: int):
+    raw_tmpl = os.path.join(DOWNLOAD_DIR, f"{chat_id}_raw.%(ext)s")
+    raw_mp4  = os.path.join(DOWNLOAD_DIR, f"{chat_id}_raw.mp4")
+    comp_mp4 = os.path.join(DOWNLOAD_DIR, f"{chat_id}_comp.mp4")
+
+    def edit(text):
+        try:
+            bot.edit_message_text(text, chat_id, status_id)
+        except Exception:
+            pass
 
     try:
-        # ── Step 1: Download ─────────────────────────────────────
-        bot.edit_message_text(
-            "📥 <b>Video ဒေါင်းလောဒ်နေပါသည်...</b>\nခဏစောင့်ပါ ⏳",
-            chat_id, status_msg.message_id
+        # ── Download ──────────────────────────────────────────────
+        edit("📥 <b>Video ဒေါင်းလောဒ်နေပါသည်...</b>\nခဏစောင့်ပါ ⏳")
+
+        with yt_dlp.YoutubeDL(ydl_opts(raw_tmpl)) as ydl:
+            info  = ydl.extract_info(url, download=True)
+            title = (info.get("title") or "Video")[:60]
+
+        # downloaded file ရှာမယ်
+        candidates = glob.glob(
+            os.path.join(DOWNLOAD_DIR, f"{chat_id}_raw.*")
         )
+        if not candidates:
+            raise FileNotFoundError("Downloaded file မတွေ့ပါ")
 
-        ydl_opts = build_ydl_opts(raw_path)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Video")[:50]
+        src = candidates[0]
+        if not src.endswith(".mp4"):
+            os.rename(src, raw_mp4)
+            src = raw_mp4
 
-        # Download ဖြစ်ပြီးသော file ရှာမယ်
-        pattern = os.path.join(DOWNLOAD_DIR, f"{chat_id}_raw.*")
-        files = glob.glob(pattern)
-        if not files:
-            raise FileNotFoundError("Downloaded file not found")
+        size = os.path.getsize(src)
+        logger.info(f"Downloaded '{title}' — {size/1024/1024:.1f} MB")
 
-        downloaded = files[0]
+        # ── Size check ────────────────────────────────────────────
+        to_send = []
 
-        # mp4 မဟုတ်ရင် rename
-        if not downloaded.endswith(".mp4"):
-            os.rename(downloaded, final_mp4)
-            downloaded = final_mp4
-
-        file_size = os.path.getsize(downloaded)
-        logger.info(f"Downloaded: {title}, Size: {file_size/1024/1024:.1f}MB")
-
-        # ── Step 2: Size Check & Process ────────────────────────
-        files_to_send = []
-
-        if file_size <= MAX_SIZE_BYTES:
-            # Size အဆင်ပြေတယ် - တိုက်ရိုက်ပို့မယ်
-            files_to_send = [downloaded]
+        if size <= MAX_BYTES:
+            to_send = [src]
 
         else:
-            # Compress ကြိုးစားမယ်
-            bot.edit_message_text(
-                "⚙️ <b>Video ကြီးတယ်၊ Compress လုပ်နေပါသည်...</b>\n"
-                "ဒါဟာ အချိန်အနည်းငယ် ကြာနိုင်ပါသည် ⏳",
-                chat_id, status_msg.message_id
+            edit(
+                "⚙️ <b>Video ကြီးနေသည်၊ Compress လုပ်နေပါသည်...</b>\n"
+                "ခဏစောင့်ပါ ⏳"
             )
+            ok = compress(src, comp_mp4)
 
-            success = compress_video(downloaded, compressed)
-
-            if success and os.path.exists(compressed):
-                comp_size = os.path.getsize(compressed)
-                logger.info(f"Compressed size: {comp_size/1024/1024:.1f}MB")
-
-                if comp_size <= MAX_SIZE_BYTES:
-                    files_to_send = [compressed]
+            if ok and os.path.exists(comp_mp4):
+                if os.path.getsize(comp_mp4) <= MAX_BYTES:
+                    to_send = [comp_mp4]
                 else:
-                    # Compress လုပ်ပေမယ့် ဆက်ကြီးနေသေးရင် ခွဲမယ်
-                    bot.edit_message_text(
-                        "✂️ <b>Video ကို Parts တွေ ခွဲနေပါသည်...</b> ⏳",
-                        chat_id, status_msg.message_id
-                    )
-                    prefix = os.path.join(DOWNLOAD_DIR, f"{chat_id}_split")
-                    files_to_send = split_video(compressed, prefix)
+                    edit("✂️ <b>Parts ခွဲနေပါသည်...</b> ⏳")
+                    pfx = os.path.join(DOWNLOAD_DIR, f"{chat_id}_split")
+                    to_send = split_parts(comp_mp4, pfx)
             else:
-                # Compress မရရင် ခွဲမယ်
-                bot.edit_message_text(
-                    "✂️ <b>Video ကို Parts တွေ ခွဲနေပါသည်...</b> ⏳",
-                    chat_id, status_msg.message_id
-                )
-                prefix = os.path.join(DOWNLOAD_DIR, f"{chat_id}_split")
-                files_to_send = split_video(downloaded, prefix)
+                edit("✂️ <b>Parts ခွဲနေပါသည်...</b> ⏳")
+                pfx = os.path.join(DOWNLOAD_DIR, f"{chat_id}_split")
+                to_send = split_parts(src, pfx)
 
-        if not files_to_send:
-            raise Exception("Video processing failed")
+        if not to_send:
+            raise RuntimeError("Video processing မအောင်မြင်ပါ")
 
-        # ── Step 3: Send ─────────────────────────────────────────
-        total = len(files_to_send)
-        for idx, fpath in enumerate(files_to_send, 1):
+        # ── Send ──────────────────────────────────────────────────
+        total = len(to_send)
+        for idx, fpath in enumerate(to_send, 1):
             if total > 1:
-                bot.edit_message_text(
-                    f"📤 <b>Telegram သို့ Upload နေပါသည်...</b>\n"
-                    f"Part {idx}/{total} ⏳",
-                    chat_id, status_msg.message_id
+                edit(
+                    f"📤 <b>Upload နေပါသည်...</b> "
+                    f"Part {idx}/{total} ⏳"
                 )
-                caption = f"🎬 <b>{title}</b>\n📌 Part {idx}/{total}"
+                cap = f"🎬 <b>{title}</b>\n📌 Part {idx}/{total}"
             else:
-                bot.edit_message_text(
-                    "📤 <b>Telegram သို့ Upload နေပါသည်...</b> ⏳",
-                    chat_id, status_msg.message_id
-                )
-                caption = f"🎬 <b>{title}</b>"
+                edit("📤 <b>Telegram သို့ Upload နေပါသည်...</b> ⏳")
+                cap = f"🎬 <b>{title}</b>"
 
             with open(fpath, "rb") as vf:
                 bot.send_video(
-                    chat_id,
-                    vf,
-                    caption=caption,
+                    chat_id, vf,
+                    caption=cap,
                     supports_streaming=True,
-                    timeout=120
+                    timeout=180
                 )
 
-        # Success message
-        bot.edit_message_text(
-            f"✅ <b>အောင်မြင်စွာ ပြီးဆုံးပါပြီ!</b>\n🎬 {title}",
-            chat_id, status_msg.message_id
-        )
+        edit(f"✅ <b>ပြီးဆုံးပါပြီ!</b>\n🎬 {title}")
 
     except yt_dlp.utils.DownloadError as e:
-        err_msg = str(e)[:200]
-        logger.error(f"yt-dlp error: {err_msg}")
-        bot.edit_message_text(
-            f"❌ <b>Download မအောင်မြင်ပါ</b>\n\n"
-            f"ဖြစ်နိုင်သောအကြောင်းများ:\n"
-            f"• Private/Restricted video ဖြစ်နေသည်\n"
-            f"• Link မမှန်ကန်ပါ\n"
-            f"• Platform က ပိတ်ဆို့ထားသည်\n\n"
-            f"<code>{err_msg}</code>",
-            chat_id, status_msg.message_id
+        edit(
+            "❌ <b>Download မအောင်မြင်ပါ</b>\n\n"
+            "ဖြစ်နိုင်သောအကြောင်းများ:\n"
+            "• Private / Restricted video ဖြစ်နေသည်\n"
+            "• Link မှားနေသည်\n"
+            "• Platform ပိတ်ဆို့ထားသည်\n\n"
+            f"<code>{str(e)[:200]}</code>"
         )
-
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        bot.edit_message_text(
-            f"❌ <b>Error ဖြစ်ပေါ်ပါသည်</b>\n<code>{str(e)[:200]}</code>",
-            chat_id, status_msg.message_id
+        logger.error(f"Unexpected: {e}")
+        edit(
+            f"❌ <b>Error ဖြစ်ပေါ်ပါသည်</b>\n"
+            f"<code>{str(e)[:200]}</code>"
         )
-
     finally:
-        # Cleanup temp files
-        pattern = os.path.join(DOWNLOAD_DIR, f"{chat_id}_*")
-        for f in glob.glob(pattern):
-            cleanup(f)
+        cleanup(chat_id)
 
-# ─── Telegram Handlers ────────────────────────────────────────────
+# ─── Telegram handlers ────────────────────────────────────────────
 @bot.message_handler(commands=["start", "help"])
-def start_handler(msg):
+def cmd_start(msg):
     bot.send_message(
         msg.chat.id,
         "👋 <b>Video Downloader Bot မှ ကြိုဆိုပါသည်!</b>\n\n"
         "📌 <b>ပံ့ပိုးသော Platform များ:</b>\n"
-        "• ▶️ YouTube\n"
-        "• 🎵 TikTok\n"
-        "• 📸 Instagram\n"
-        "• 👥 Facebook\n\n"
+        "▶️ YouTube  •  🎵 TikTok\n"
+        "📸 Instagram  •  👥 Facebook\n\n"
         "🔗 <b>အသုံးပြုနည်း:</b>\n"
-        "Video link ကို ဒီ chat ထဲ paste လုပ်ပြီး send လုပ်ပါ\n\n"
-        "⚡ Bot က အလိုအလျောက် download လုပ်ပေးမည်\n"
-        "📦 49MB ကျော်သော video များကို အလိုအလျောက် compress "
+        "Video link ကို ဒီ chat ထဲ paste ပြီး send လုပ်ပါ\n\n"
+        "📦 49 MB ကျော်ပါက အလိုအလျောက် compress "
         "သို့မဟုတ် parts ခွဲပေးမည်"
     )
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
-def url_handler(msg):
-    url = extract_url(msg.text.strip())
+def on_text(msg):
+    url = find_url(msg.text.strip())
     if not url:
-        bot.send_message(
-            msg.chat.id,
-            "⚠️ Valid video link မတွေ့ပါ\n\n"
-            "YouTube, TikTok, Instagram, Facebook link ပို့ပါ"
+        bot.reply_to(
+            msg,
+            "⚠️ Valid video link မတွေ့ပါ\n"
+            "YouTube / TikTok / Instagram / Facebook link ပို့ပါ"
         )
         return
 
-    status = bot.send_message(
-        msg.chat.id,
-        "🔍 <b>Link စစ်ဆေးနေပါသည်...</b>"
-    )
-
-    thread = threading.Thread(
-        target=download_and_send,
-        args=(msg.chat.id, url, status),
+    status = bot.send_message(msg.chat.id, "🔍 <b>Link စစ်ဆေးနေပါသည်...</b>")
+    threading.Thread(
+        target=process,
+        args=(msg.chat.id, url, status.message_id),
         daemon=True
-    )
-    thread.start()
+    ).start()
 
-# ─── Entry Point ──────────────────────────────────────────────────
+# ─── Entry point ──────────────────────────────────────────────────
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    logger.info("🚀 Bot starting...")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable မသတ်မှတ်ရသေး!")
 
-    # Flask ကို background thread မှာ run မယ်
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"🌐 Web server running on port {PORT}")
+    logger.info("🚀 Starting Video Downloader Bot …")
 
-    # Bot ကို main thread မှာ polling run မယ်
-    logger.info("🤖 Bot polling started...")
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info(f"🌐 Flask web server → port {PORT}")
+
+    logger.info("🤖 Telegram polling started …")
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
