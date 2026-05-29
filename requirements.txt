@@ -1,0 +1,4 @@
+pyTelegramBotAPI==4.20.0
+yt-dlp==2024.12.13
+Flask==3.0.3
+requests==2.32.3
